@@ -1,5 +1,6 @@
 from django.db import transaction
 from rest_framework.exceptions import ValidationError
+from django.db.models import F
 
 from .models import (
     Product,
@@ -23,6 +24,9 @@ def adjust_stock(
     if direction not in ("IN", "OUT"):
         raise ValidationError("Invalid stock adjustment direction.")
 
+    if quantity < 1:
+        raise ValidationError("Adjustment quantity must be positive.")
+
     # Lock the product and warehouse rows first.
     # This serializes stock operations for the same product/location.
     Product.objects.select_for_update().get(pk=product.pk)
@@ -36,6 +40,9 @@ def adjust_stock(
 
     stock = StockLevel.objects.select_for_update().get(pk=stock.pk)
 
+    if stock.available_quantity < quantity and direction == "OUT":
+        raise ValidationError("Cannot issue reserved stock.")
+
     quantity_before = stock.quantity
 
     if direction == "IN":
@@ -45,6 +52,18 @@ def adjust_stock(
         if quantity_before < quantity:
             raise ValidationError(
                 {"quantity": (f"Insufficient stock. Available: {quantity_before}.")}
+            )
+
+        if stock.available_quantity < quantity:
+            raise ValidationError(
+                {
+                    "quantity": (
+                        f"Cannot issue reserved stock. "
+                        f"Total: {quantity_before}, "
+                        f"Reserved: {stock.reserved_quantity}, "
+                        f"Available: {stock.available_quantity}."
+                    )
+                }
             )
 
         quantity_after = quantity_before - quantity
@@ -79,6 +98,9 @@ def transfer_stock(
 ) -> tuple[StockMovement, StockMovement]:
     if source_warehouse.pk == destination_warehouse.pk:
         raise ValidationError("Source and destination warehouses must be different.")
+
+    if quantity < 1:
+        raise ValidationError("Transfer quantity must be positive.")
 
     Product.objects.select_for_update().get(pk=product.pk)
 
@@ -136,6 +158,18 @@ def transfer_stock(
             }
         )
 
+    if source_stock.available_quantity < quantity:
+        raise ValidationError(
+            {
+                "quantity": (
+                    f"Cannot transfer reserved stock. "
+                    f"Total: {source_stock.quantity}, "
+                    f"Reserved: {source_stock.reserved_quantity}, "
+                    f"Available: {source_stock.available_quantity}."
+                )
+            }
+        )
+
     source_before = source_stock.quantity
     destination_before = destination_stock.quantity
 
@@ -173,3 +207,103 @@ def transfer_stock(
     )
 
     return movements[0], movements[1]
+
+
+@transaction.atomic
+def reserve_stock(*, product_id: int, warehouse_id: int, quantity: int) -> StockLevel:
+    if quantity < 1:
+        raise ValidationError("Reservation quantity must be positive.")
+
+    stock = (
+        StockLevel.objects.select_for_update()
+        .filter(product_id=product_id, warehouse_id=warehouse_id)
+        .first()
+    )
+
+    if stock is None:
+        raise ValidationError("No stock record exists for this product and warehouse.")
+
+    if stock.available_quantity < quantity:
+        raise ValidationError(
+            f"Insufficient available stock. Available: {stock.available_quantity}."
+        )
+
+    stock.reserved_quantity = F("reserved_quantity") + quantity
+    stock.save(update_fields=["reserved_quantity"])
+
+    stock.refresh_from_db()
+    return stock
+
+
+@transaction.atomic
+def release_reserved_stock(
+    *,
+    product_id: int,
+    warehouse_id: int,
+    quantity: int,
+) -> StockLevel:
+    if quantity < 1:
+        raise ValidationError("Release quantity must be positive.")
+
+    stock = (
+        StockLevel.objects.select_for_update()
+        .filter(product_id=product_id, warehouse_id=warehouse_id)
+        .first()
+    )
+
+    if stock is None or stock.reserved_quantity < quantity:
+        raise ValidationError("The requested stock reservation does not exist.")
+
+    stock.reserved_quantity = F("reserved_quantity") - quantity
+    stock.save(update_fields=["reserved_quantity"])
+
+    stock.refresh_from_db()
+    return stock
+
+
+@transaction.atomic
+def dispatch_reserved_stock(
+    *,
+    product_id: int,
+    warehouse_id: int,
+    quantity: int,
+    reference: str,
+    notes: str,
+    user,
+) -> StockLevel:
+    if quantity < 1:
+        raise ValidationError("Dispatch quantity must be positive.")
+
+    stock = (
+        StockLevel.objects.select_for_update()
+        .select_related("product", "warehouse")
+        .filter(product_id=product_id, warehouse_id=warehouse_id)
+        .first()
+    )
+
+    if stock is None:
+        raise ValidationError("No stock record exists.")
+
+    if stock.reserved_quantity < quantity or stock.quantity < quantity:
+        raise ValidationError("Insufficient reserved or physical stock.")
+
+    before = stock.quantity
+
+    stock.quantity = F("quantity") - quantity
+    stock.reserved_quantity = F("reserved_quantity") - quantity
+    stock.save(update_fields=["quantity", "reserved_quantity"])
+    stock.refresh_from_db()
+
+    StockMovement.objects.create(
+        product_id=product_id,
+        warehouse_id=warehouse_id,
+        movement_type=StockMovement.MovementType.ISSUE,
+        quantity=quantity,
+        quantity_before=before,
+        quantity_after=stock.quantity,
+        reference=reference,
+        notes=notes,
+        created_by=user,
+    )
+
+    return stock

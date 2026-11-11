@@ -83,6 +83,12 @@ class StockLevel(TimeStampedModel):
 
     quantity = models.PositiveIntegerField(default=0)
 
+    reserved_quantity = models.PositiveIntegerField(default=0)
+
+    @property
+    def available_quantity(self) -> int:
+        return self.quantity - self.reserved_quantity
+
     class Meta:
         constraints = [
             models.UniqueConstraint(
@@ -92,6 +98,10 @@ class StockLevel(TimeStampedModel):
             models.CheckConstraint(
                 condition=models.Q(quantity__gte=0),
                 name="stock_quantity_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(reserved_quantity__lte=models.F("quantity")),
+                name="stock_reserved_lte_quantity",
             ),
         ]
         indexes = [
