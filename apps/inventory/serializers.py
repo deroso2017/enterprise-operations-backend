@@ -72,6 +72,9 @@ class StockLevelSerializer(serializers.ModelSerializer):
         source="product.reorder_level",
         read_only=True,
     )
+    reserved_quantity = serializers.IntegerField(read_only=True)
+    available_quantity = serializers.IntegerField(read_only=True)
+
     is_low_stock = serializers.SerializerMethodField()
 
     class Meta:
